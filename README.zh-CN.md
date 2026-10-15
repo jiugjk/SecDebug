@@ -8,10 +8,9 @@
 客户端 SDK、协议测试、隔离的编译测试桩，以及宿主（host）的**参考补丁**。
 **它不是可直接部署的二进制程序，也不是经过目标设备认证的发行版。**
 
-**免责声明：** 本项目仅供获得明确授权的安全调试和研究。内核内存操作及断点可能导致
-设备崩溃、数据损坏或安全机制失效。维护者不保证设备兼容性、适销性、特定用途适用性
-或运行安全性；未经真实目标设备验证，请勿用于生产环境。详见
-[DISCLAIMER.md](DISCLAIMER.md)、[SECURITY.md](SECURITY.md) 和相关许可证条款。
+**免责声明：** 仅供获得明确授权的安全调试与研究。内核内存操作与断点可能导致崩溃
+或数据损坏。不保证运行时/设备兼容性——详见 [DISCLAIMER.md](DISCLAIMER.md)、
+[SECURITY.md](SECURITY.md) 与 [LICENSE](LICENSE)。
 
 SecDebug 是面向 KernelPatch/KPatch-Next 的高权限内核补丁模块（Kernel Patch Module，
 KPM），用于在获得授权的情况下，对其他进程的**用户态虚拟地址**进行内存读取、写入，
@@ -81,13 +80,9 @@ make client       # 构建 CLI 示例
 make package      # 生成干净的源码 ZIP，并保留 Shell 脚本可执行权限
 ```
 
-`make package` 生成的源码归档会排除 `.git`、`build/` 和 `dist/`，并保留 Shell 脚本的
-POSIX 可执行权限。如果解压工具丢失了这些权限，`make check-stub` 和
-`make sanitize` 仍会通过 `sh` 调用相关脚本。
-
-**AArch64 桩构建只验证 C 语法和代码生成**，不能产出安全的 `.kpm` 二进制。
-只有经过审计的真实 KernelPatch 源码树才能用于该构建，并且 perf/RCU 的运行行为
-只能在真实 ARM64 设备上验证。
+`make package` 排除 `.git`/`build`/`dist` 并保留脚本可执行位（桩构建也会用
+`sh` 调用脚本）。**AArch64 桩只验语法/代码生成**；真实 `.kpm` 需要经审计的
+KernelPatch 树，perf/RCU 行为只能在 ARM64 设备上验证。
 
 ### 构建 KPM（仅在核实宿主契约后）
 
@@ -110,20 +105,10 @@ make KP_DIR=/absolute/path/to/audited/KernelPatch \
 任何特定设备的真实配置**。KPM 编译参数包含 `-mgeneral-regs-only`，避免 Clang
 在 `-O2` 下为模块生成 NEON 指令。
 
-**可选：针对手机 CPU 调度优化（不保证性能提升）。** 默认 `KPM_TUNE=generic`
-使用 `-mcpu=generic -O2`，以保持较广的 ARM64 兼容性。确认 CPU 类型且完成基准
-测试后，可传入例如 `KPM_TUNE=cortex-a78`，追加 `-mtune=cortex-a78`。
-它只改变指令调度，不启用新的 CPU 专属指令，也不改变
-`-mgeneral-regs-only` / `-mno-outline-atomics` 安全参数。
-现代手机具有不同的大核/小核，为一种核心优化可能降低另一种核心的性能。
-本项目未启用 `-O3`、LTO 或 `-mcpu=native`：它们可能改变代码体积或指令集要求，
-不能假定一定会加速此模块。硬件断点与跨进程内存操作的主要耗时来自内核调用、锁和
-缺页处理，因此选择优化选项前，应在经过授权的测试设备上测量读写吞吐量与断点延迟。
-
-如需在**不生成可部署 KPM**的情况下检查交叉编译器是否支持指定调优参数，可执行
-`make check-stub KPM_TUNE=cortex-a78`。调优参数会记录在配置指纹和
-`BUILD-METADATA` 中；更改它会触发 KPM 完整重新编译。若实际编译器不支持，请改回
-`generic`。
+**可选 CPU 调优：** 默认 `KPM_TUNE=generic`（`-mcpu=generic -O2`）。确认 CPU
+并完成基准后可传如 `KPM_TUNE=cortex-a78`（仅 `-mtune`，安全参数不变）。大小核
+可能互相拖累；未启用 `-O3`/LTO/`-mcpu=native`。可用
+`make check-stub KPM_TUNE=cortex-a78` 探测；调优写入配置指纹，变更会强制完整重编。
 
 如果缺少宿主契约确认、受支持的 Git 提交、完整的已批准宿主补丁、目标页大小或
 `FOLL_FORCE` 设置，此命令会**主动失败**。仅支持 `host_patches/hosts.json`
@@ -132,12 +117,9 @@ make KP_DIR=/absolute/path/to/audited/KernelPatch \
 `build/BUILD-METADATA.txt`。**构建期检查不等于运行时兼容性认证。**
 安装前必须阅读 [SECURITY.md](SECURITY.md)。
 
-`build/build-config.json` 会记录编译器/链接器标识、编译参数、宿主提交、已批准补丁
-哈希和已验证的内核源码哈希。改变已接受的构建参数会使所有 KPM 目标文件失效并
-重新构建；配置未变则保持对象文件的修改时间不变。链接和符号验证先针对临时文件
-执行；失败时会移除最终 KPM 和元数据产物，缺少元数据也会触发重新链接。
-元数据包含配置与 ELF SHA256 值。**不要让多个独立的 make 进程共用同一个
-`BUILD_DIR`。**
+`build/build-config.json` 记录编译器/链接器、参数、宿主提交、补丁哈希与已验证
+内核源码哈希。改变已接受参数会使 KPM 目标失效；配置不变则保留对象 mtime。链接/
+符号检查走临时文件，失败会移除最终产物。**不要多个 make 共用同一 `BUILD_DIR`。**
 
 ## 加载与 SDK 使用
 

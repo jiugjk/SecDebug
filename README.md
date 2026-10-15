@@ -8,11 +8,9 @@
 protocol tests, isolated compile-test stubs and host **reference** patches.
 It is **not** a ready-to-deploy binary or a device-certified release.
 
-**免责声明 / Disclaimer:** 本项目仅供获得明确授权的安全调试和研究，
-内核内存操作及断点可能导致设备崩溃、数据损坏或安全失效。作者不承诺设备兼容性、
-适销性、特定用途适用性或运行安全性；未经真实目标设备验证请勿用于生产环境。
-The maintainers provide no device compatibility or runtime safety guarantee.
-See [DISCLAIMER.md](DISCLAIMER.md), [SECURITY.md](SECURITY.md) and license terms.
+**Disclaimer:** Authorized security research only. Kernel memory ops and breakpoints
+can crash devices or corrupt data. No runtime/device guarantees — see
+[DISCLAIMER.md](DISCLAIMER.md), [SECURITY.md](SECURITY.md), and [LICENSE](LICENSE).
 
 SecDebug is a high-privilege KernelPatch/KPatch-Next Kernel Patch Module for
 authorized cross-process *user-virtual-address* memory inspection, writing
@@ -84,14 +82,10 @@ make client       # build CLI example
 make package      # create clean source ZIP, keeping executable shell permissions
 ```
 
-The source archive created by `make package` deliberately excludes `.git`,
-`build/` and `dist/`. Its Shell script entries retain POSIX executable bits;
-`make check-stub` / `make sanitize` also invoke scripts with `sh` to remain
-usable after extraction by tools that discard those bits.
-
-The AArch64 stub build verifies **C syntax/code generation only**, and cannot
-produce a safe `.kpm` binary. Only a real audited KernelPatch tree can do
-that, and only an ARM64 device can test perf/RCU behavior.
+`make package` excludes `.git`/`build`/`dist` and keeps script execute bits
+(stubs also call scripts via `sh`). The AArch64 stub checks **C syntax/codegen
+only** — a real audited KernelPatch tree is required for `.kpm`, and only an
+ARM64 device can exercise perf/RCU.
 
 ### KPM build (only after verifying host contract)
 
@@ -114,23 +108,11 @@ aligned offset; the build gate AND a C preprocessor error reject it. The page
 shift and flag above are **examples, not a claim** about your device. KPM C flags include
 `-mgeneral-regs-only` so Clang `-O2` does not emit NEON in the module.
 
-**Optional phone CPU tuning (performance is not guaranteed):** the default
-`KPM_TUNE=generic` retains `-mcpu=generic -O2` for broad ARM64 compatibility.
-For an identified and **benchmarked** CPU family, you may pass, for example,
-`KPM_TUNE=cortex-a78` to add `-mtune=cortex-a78`. This changes code scheduling
-without enabling new CPU-specific instructions; it does not change the
-`-mgeneral-regs-only` / `-mno-outline-atomics` safety flags. Modern phones
-have different big/little cores: tuning for one core can hurt another. `-O3`,
-LTO, and `-mcpu=native` are **not** enabled; they can change code size or ISA
-requirements and must not be assumed to make this module faster. Hardware
-breakpoint and cross-process memory operations are mainly governed by kernel
-calls, locking and memory faults, so measure read/write throughput and
-breakpoint latency on an authorized test device before selecting a tune.
-
-To check that the requested tune is accepted by the cross-compiler without
-building a deployable KPM, use `make check-stub KPM_TUNE=cortex-a78`. The tune
-is recorded in the configuration fingerprint and BUILD-METADATA; changing it
-forces a full KPM recompile. If the actual compiler rejects it, use `generic`.
+**Optional CPU tune:** default `KPM_TUNE=generic` (`-mcpu=generic -O2`).
+For a benchmarked CPU you may pass e.g. `KPM_TUNE=cortex-a78` (`-mtune=…` only;
+safety flags stay). Big/little phones may regress on the other cluster; `-O3`/LTO/
+`-mcpu=native` are off. Probe with `make check-stub KPM_TUNE=cortex-a78` — the
+tune is in the config fingerprint and forces a full KPM rebuild when changed.
 
 This command intentionally **fails** when the contract acknowledgement,
 supported git commit, complete approved host patch, page size, or `FOLL_FORCE`
@@ -140,13 +122,11 @@ generates `build/secdebug.kpm` and `build/BUILD-METADATA.txt` if host headers,
 linking and symbol validation all succeed. Build-time checks do NOT certify
 runtime compatibility. Review `SECURITY.md` before installing.
 
-`build/build-config.json` records the compiler/linker identity, flags, host
-commit, approved patch hash and verified kernel-source hash. Changing an
-accepted build parameter invalidates all KPM objects. An unchanged
-configuration keeps object mtimes stable. Linking and symbol verification run
-on a temporary file; failures remove final KPM/metadata outputs, and a missing
-metadata file causes re-linking. Metadata includes the configuration and ELF
-SHA256 values. Do not run independent make processes in the same BUILD_DIR.
+`build/build-config.json` records compiler/linker, flags, host commit, patch
+hash and verified kernel-source hash. Changing an accepted parameter invalidates
+KPM objects; unchanged configs keep object mtimes. Link/symbol checks use a temp
+file; failures remove final outputs. Do not share one `BUILD_DIR` across make
+processes.
 
 ## Load and SDK usage
 

@@ -1,0 +1,52 @@
+# SPDX-License-Identifier: Apache-2.0
+name: secdebug-ci
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  userspace-and-arm64-stub:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install compilers
+        run: sudo apt-get update && sudo apt-get install -y git make clang lld llvm python3 binutils gcc
+      - name: Protocol, SDK and fake-mm lifecycle checks
+        run: make check
+      - name: AArch64 compile/link against isolated stubs (not a real KPM)
+        run: make check-stub
+  sanitizers:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install clang
+        run: sudo apt-get update && sudo apt-get install -y git make clang lld llvm python3 binutils gcc
+      - name: Address/undefined-behavior sanitizer regression suite
+        run: make sanitize
+  host-reference-patches:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Shallow-fetch the pinned host commits
+        run: |
+          git init /tmp/KernelPatch
+          git -C /tmp/KernelPatch fetch --depth 1 https://github.com/bmax121/KernelPatch.git f36f3d1377004871f8c964f7cd3276712eeba943
+          git -C /tmp/KernelPatch checkout FETCH_HEAD
+          git init /tmp/KPatch-Next
+          git -C /tmp/KPatch-Next fetch --depth 1 https://github.com/KernelSU-Next/KPatch-Next.git 456744b29efb9989445463ab29e368fa59a103c4
+          git -C /tmp/KPatch-Next checkout FETCH_HEAD
+      - name: Real baseline application and exact patched-tree verification
+        run: |
+          sh host_patches/apply_checked.sh /tmp/KernelPatch KernelPatch --check
+          sh host_patches/apply_checked.sh /tmp/KPatch-Next KPatch-Next --check
+            sh host_patches/apply_checked.sh /tmp/KernelPatch KernelPatch --apply
+            sh host_patches/apply_checked.sh /tmp/KernelPatch KernelPatch --verify
+            sh host_patches/apply_checked.sh /tmp/KPatch-Next KPatch-Next --apply
+            sh host_patches/apply_checked.sh /tmp/KPatch-Next KPatch-Next --verify
+      - name: Install ARM64 compile-only toolchain
+        run: sudo apt-get update && sudo apt-get install -y make clang lld llvm python3 binutils
+      - name: Compile KPM against both actual host header trees (not device validation)
+        run: |
+          make BUILD_DIR=build-kp KP_DIR=/tmp/KernelPatch HOST_COMMIT=f36f3d1377004871f8c964f7cd3276712eeba943 TARGET_PAGE_SHIFT=12 SECDEBUG_FOLL_FORCE=0 HOST_CONTRACT_ACK=I_ACKNOWLEDGE_VERIFIED_HOST
+          make BUILD_DIR=build-kpn KP_DIR=/tmp/KPatch-Next HOST_COMMIT=456744b29efb9989445463ab29e368fa59a103c4 TARGET_PAGE_SHIFT=12 SECDEBUG_FOLL_FORCE=0 HOST_CONTRACT_ACK=I_ACKNOWLEDGE_VERIFIED_HOST

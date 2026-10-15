@@ -1,0 +1,20 @@
+secdebug contains code under multiple licenses. The SPDX-License-Identifier in
+an individual source file is authoritative for that file.
+
+- Kernel/KPM sources are licensed under GPL-2.0-only.
+- Userspace client and test sources marked Apache-2.0 are licensed under the
+  Apache License 2.0.
+- Project-authored documentation, build metadata, CI configuration, and helper
+  scripts marked Apache-2.0 are licensed under the Apache License 2.0.
+- The shared protocol header include/secdebug_proto.h is dual-licensed under
+  GPL-2.0-only OR Apache-2.0. Kernel/KPM code may consume it under GPL-2.0-only,
+  while userspace SDKs and third-party integrations may consume it under
+  Apache-2.0.
+
+Full license texts are provided in:
+
+  LICENSES/GPL-2.0.txt
+  LICENSES/Apache-2.0.txt
+
+Third-party interoperability and provenance notes are documented in
+THIRD_PARTY_NOTICES.md.

@@ -1,0 +1,14 @@
+# Build outputs
+/build/
+dist/
+*.o
+*.d
+*.kpm
+
+# Editor / OS noise
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo

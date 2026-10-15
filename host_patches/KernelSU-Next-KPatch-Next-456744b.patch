@@ -1,0 +1,525 @@
+diff --git a/kernel/patch/include/module.h b/kernel/patch/include/module.h
+--- a/kernel/patch/include/module.h
++++ b/kernel/patch/include/module.h
+@@ -49,6 +49,11 @@
+     void *start;
+ 
+     struct list_head list;
++
++    /* module_lock covers list edits, unloading, and ctl_active.
++     * ctl_active counts callbacks that may drop the host RCU section. */
++    int unloading;
++    int ctl_active;
+ };
+ 
+ long load_module(const void *data, int len, const char *args, const char *event, void *__user reserved);
+diff --git a/kernel/patch/module/module.c b/kernel/patch/module/module.c
+--- a/kernel/patch/module/module.c
++++ b/kernel/patch/module/module.c
+@@ -395,6 +395,51 @@
+ struct module modules = { 0 };
+ static spinlock_t module_lock;
+ 
++/* Caller holds module_lock. The list is not an RCU walk here. */
++static struct module *find_module_locked(const char *name)
++{
++    struct module *pos;
++
++    list_for_each_entry(pos, &modules.list, list)
++    {
++        if (!strcmp(name, pos->info.name)) return pos;
++    }
++    return 0;
++}
++
++static void module_put_active(struct module *mod)
++{
++    unsigned long flags;
++    flags = spin_lock_irqsave(&module_lock);
++    if (mod && mod->ctl_active > 0) mod->ctl_active--;
++    spin_unlock_irqrestore(&module_lock, flags);
++}
++
++static void module_redact_args(struct module *mod)
++{
++    size_t n;
++
++    if (!mod || !mod->args) return;
++    n = strlen(mod->args);
++    memset(mod->args, 0, n);
++}
++
++/* A required import in SecDebug: no export means the loader rejects the KPM
++ * before INIT (including the unsupported independent LKM loader).
++ * Never advertise a safe contract when an essential kernel primitive is absent.
++ */
++unsigned long secdebug_host_contract_v1(void)
++{
++    if (!kfunc(synchronize_rcu) || !kfunc(__rcu_read_lock) ||
++        !kfunc(__rcu_read_unlock) || !kfunc(_raw_spin_lock_irqsave) ||
++        !kfunc(_raw_spin_unlock_irqrestore))
++        return 0;
++    return 0x53440101UL;
++}
++KP_EXPORT_SYMBOL(secdebug_host_contract_v1);
++
+ long load_module(const void *data, int len, const char *args, const char *event, void *__user reserved)
+ {
++    unsigned long flags;
++    if (!secdebug_host_contract_v1()) return -EOPNOTSUPP;
+     struct load_info load_info = { .len = len, .hdr = data };
+@@ -404,11 +449,14 @@
+     if ((rc = elf_header_check(info))) goto out;
+     if ((rc = setup_load_info(info))) goto out;
+ 
+-    if (find_module(info->info.name)) {
++    flags = spin_lock_irqsave(&module_lock);
++    if (find_module_locked(info->info.name)) {
++        spin_unlock_irqrestore(&module_lock, flags);
+         logkfd("%s exist\n", info->info.name);
+         rc = -EEXIST;
+         goto out;
+     }
++    spin_unlock_irqrestore(&module_lock, flags);
+ 
+     struct module *mod = (struct module *)vmalloc(sizeof(struct module));
+     if (!mod) return -ENOMEM;
+@@ -433,13 +481,24 @@
+     flush_icache_all();
+ 
+     rc = (*mod->init)(mod->args, event, reserved);
++    /* init has copied what it needs. Do not keep the load token queryable. */
++    module_redact_args(mod);
+ 
+     if (!rc) {
+-        logkfi("[%s] succeed with [%s] \n", mod->info.name, args);
+-        list_add_tail(&mod->list, &modules.list);
+-        goto out;
++        int duplicate = 0;
++
++        logkfi("[%s] succeed (load args redacted)\n", mod->info.name);
++        flags = spin_lock_irqsave(&module_lock);
++        if (find_module_locked(mod->info.name))
++            duplicate = 1;
++        else
++            list_add_tail_rcu(&mod->list, &modules.list);
++        spin_unlock_irqrestore(&module_lock, flags);
++        if (!duplicate) goto out;
++        rc = -EEXIST;
++        (*mod->exit)(reserved);
+     } else {
+-        logkfi("[%s] failed with [%s] error: %d, try exit ...\n", mod->info.name, args, rc);
++        logkfi("[%s] failed (load args redacted), error: %ld\n", mod->info.name, rc);
+         (*mod->exit)(reserved);
+     }
+ 
+@@ -452,33 +511,56 @@
+     return rc;
+ }
+ 
+-// todo: lock
+ long unload_module(const char *name, void *__user reserved)
+ {
++    struct module *mod;
++    unsigned long flags;
++    long rc;
++
+     if (!name) return -EINVAL;
+-    logkfe("name: %s\n", name);
++    if (!secdebug_host_contract_v1()) return -EOPNOTSUPP;
++    flags = spin_lock_irqsave(&module_lock);
++    mod = find_module_locked(name);
++    if (!mod) {
++        spin_unlock_irqrestore(&module_lock, flags);
++        return -ENOENT;
++    }
++    if (mod->unloading || mod->ctl_active != 0) {
++        spin_unlock_irqrestore(&module_lock, flags);
++        return -EBUSY;
++    }
++    /* Close callback admission, but reserve this name until exit succeeds.
++     * Keeping the entry linked also makes refusal recoverable without a
++     * duplicate-name race. Query readers only inspect immutable metadata. */
++    mod->unloading = 1;
++    spin_unlock_irqrestore(&module_lock, flags);
+ 
+-    rcu_read_lock();
+-    long rc = 0;
++    synchronize_rcu();
++    /* No in-flight callback can still be executing (even with RCU dropped).
++     * Never spin or repeatedly schedule while waiting for another task. */
++    rc = (*mod->exit)(reserved);
++    if (rc) {
++        /* EXIT refusal must precede destructive teardown. */
++        flags = spin_lock_irqsave(&module_lock);
++        mod->unloading = 0;
++        spin_unlock_irqrestore(&module_lock, flags);
++        return rc;
++    }
++    flags = spin_lock_irqsave(&module_lock);
++    list_del_rcu(&mod->list);
++    spin_unlock_irqrestore(&module_lock, flags);
++    /* Drain ALL pre-unlink metadata readers before freeing args/text/mod. */
++    synchronize_rcu();
+ 
+-    struct module *mod = find_module(name);
+-    if (!mod) {
+-        rc = -ENOENT;
+-        goto out;
++    if (mod->args) {
++        module_redact_args(mod);
++        kvfree(mod->args);
+     }
+-    list_del(&mod->list);
+-    rc = (*mod->exit)(reserved);
+-
+-    if (mod->args) kvfree(mod->args);
++    /* ctl_args is legacy shared state. Control no longer publishes it. */
+     if (mod->ctl_args) kvfree(mod->ctl_args);
+-
+     kp_free_exec(mod->start);
+     kvfree(mod);
+-
+-    logkfi("name: %s, rc: %d\n", name, rc);
+-
+-out:
+-    rcu_read_unlock();
++    logkfi("name: %s, rc: %ld\n", name, rc);
+     return rc;
+ }
+ 
+@@ -524,75 +606,111 @@
+ 
+ long module_control0(const char *name, const char *ctl_args, char *__user out_msg, int outlen)
+ {
++    unsigned long flags;
++    if (!secdebug_host_contract_v1()) return -EOPNOTSUPP;
++    char *request_args;
++    struct module *mod;
++    mod_ctl0call_t ctl;
++    long rc = 0;
++    int args_len;
++
+     if (!name || !ctl_args) return -EINVAL;
+-    int args_len = strlen(ctl_args);
++    if (strnlen(name, KPM_NAME_LEN) >= KPM_NAME_LEN) return -ENAMETOOLONG;
++    args_len = strnlen(ctl_args, KPM_ARGS_LEN);
++    if (args_len >= KPM_ARGS_LEN) return -E2BIG;
+     if (args_len <= 0) return -EINVAL;
+ 
+-    logkfi("name %s, args: %s\n", name, ctl_args);
++    /* Payload is a Base64 request and may contain the auth token. */
++    logkfi("module %s ctl0 (payload redacted)\n", name);
+ 
+-    long rc = 0;
++    /*
++     * Private buffer for this invocation. Never store it in mod->ctl_args:
++     * a concurrent ctl0 used to kvfree that shared pointer. Allocation
++     * failure leaves mod->ctl_args untouched (and normally NULL).
++     */
++    request_args = vmalloc(args_len + 1);
++    if (!request_args) return -ENOMEM;
++    memcpy(request_args, ctl_args, args_len + 1);
++
++    flags = spin_lock_irqsave(&module_lock);
++    mod = find_module_locked(name);
++    if (!mod) {
++        spin_unlock_irqrestore(&module_lock, flags);
++        rc = -ENOENT;
++        goto free_args;
++    }
++    if (mod->unloading || mod->ctl_active == 0x7fffffff) {
++        spin_unlock_irqrestore(&module_lock, flags);
++        rc = -EBUSY;
++        goto free_args;
++    }
++    if (!mod->ctl0 || !*mod->ctl0) {
++        logkfe("no ctl0\n");
++        spin_unlock_irqrestore(&module_lock, flags);
++        rc = -ENOSYS;
++        goto free_args;
++    }
++    mod->ctl_active++;
++    ctl = *mod->ctl0;
++    spin_unlock_irqrestore(&module_lock, flags);
++
++    /* One outer RCU nest: secdebug drops and restores it around sleeps. */
+     rcu_read_lock();
++    rc = ctl(request_args, out_msg, outlen);
++    rcu_read_unlock();
++    module_put_active(mod);
+ 
+-    struct module *mod = find_module(name);
+-    if (!mod) {
+-        rc = -ENOENT;
+-        goto out;
+-    }
+-
+-    if (!*mod->ctl0) {
+-        logkfe("no ctl0\n");
+-        rc = -ENOSYS;
+-        goto out;
+-    }
+-
+-    if (mod->ctl_args) kvfree(mod->ctl_args);
+-
+-    mod->ctl_args = vmalloc(args_len + 1);
+-    if (!mod->ctl_args) {
+-        rc = -ENOMEM;
+-        goto out;
+-    }
+-
+-    strcpy(mod->ctl_args, ctl_args);
+-
+-    rc = (*mod->ctl0)(mod->ctl_args, out_msg, outlen);
+-
+-    logkfi("name: %s, rc: %d\n", name, rc);
+-out:
+-    rcu_read_unlock();
++    logkfi("name: %s, rc: %ld\n", name, rc);
++free_args:
++    memset(request_args, 0, args_len + 1);
++    kvfree(request_args);
+     return rc;
+ }
+ 
+ long module_control1(const char *name, void *a1, void *a2, void *a3)
+ {
+-    logkfi("name %s, a1: %llx, a2: %llx, a3: %llx\n", name, a1, a2, a3);
++    unsigned long flags;
++    if (!secdebug_host_contract_v1()) return -EOPNOTSUPP;
++    struct module *mod;
++    mod_ctl1call_t ctl;
+     long rc = 0;
++
++    if (!name) return -EINVAL;
++    logkfi("module %s ctl1 (payload redacted)\n", name);
++
++    flags = spin_lock_irqsave(&module_lock);
++    mod = find_module_locked(name);
++    if (!mod) {
++        spin_unlock_irqrestore(&module_lock, flags);
++        return -ENOENT;
++    }
++    if (mod->unloading || mod->ctl_active == 0x7fffffff) {
++        spin_unlock_irqrestore(&module_lock, flags);
++        return -EBUSY;
++    }
++    if (!mod->ctl1 || !*mod->ctl1) {
++        logkfe("no ctl1\n");
++        spin_unlock_irqrestore(&module_lock, flags);
++        return -ENOSYS;
++    }
++    mod->ctl_active++;
++    ctl = *mod->ctl1;
++    spin_unlock_irqrestore(&module_lock, flags);
++
+     rcu_read_lock();
++    rc = ctl(a1, a2, a3);
++    rcu_read_unlock();
++    module_put_active(mod);
+ 
+-    struct module *mod = find_module(name);
+-    if (!mod) {
+-        rc = -ENOENT;
+-        goto out;
+-    }
+-
+-    if (!*mod->ctl1) {
+-        logkfe("no ctl1\n");
+-        rc = -ENOSYS;
+-        goto out;
+-    }
+-
+-    rc = (*mod->ctl1)(a1, a2, a3);
+-
+-    logkfi("name: %s, rc: %d\n", name, rc);
+-out:
+-    rcu_read_unlock();
++    logkfi("name: %s, rc: %ld\n", name, rc);
+     return rc;
+ }
+ 
+ struct module *find_module(const char *name)
+ {
+     struct module *pos;
+-    list_for_each_entry(pos, &modules.list, list)
++
++    list_for_each_entry_rcu(pos, &modules.list, list)
+     {
+         if (!strcmp(name, pos->info.name)) {
+             return pos;
+@@ -603,11 +721,11 @@
+ 
+ int get_module_nums()
+ {
+-    rcu_read_lock();
+-
+     struct module *pos;
+     int n = 0;
+-    list_for_each_entry(pos, &modules.list, list)
++
++    rcu_read_lock();
++    list_for_each_entry_rcu(pos, &modules.list, list)
+     {
+         n++;
+     }
+@@ -619,40 +737,70 @@
+ 
+ int list_modules(char *out_names, int size)
+ {
+-    rcu_read_lock();
+-
+     struct module *pos;
+     int off = 0;
+-    list_for_each_entry(pos, &modules.list, list)
++
++    if (!out_names || size <= 0) return -EINVAL;
++    out_names[0] = '\0';
++
++    rcu_read_lock();
++    list_for_each_entry_rcu(pos, &modules.list, list)
+     {
+-        off += snprintf(out_names + off, size - 1 - off, "%s\n", pos->info.name);
++        int remaining = size - off;
++        int written;
++
++        if (remaining <= 1)
++            break;
++        written = snprintf(out_names + off, (size_t)remaining, "%s\n", pos->info.name);
++        if (written < 0) {
++            out_names[off] = '\0';
++            rcu_read_unlock();
++            return -EIO;
++        }
++        if (written >= remaining) {
++            /* Discard partial names instead of publishing corrupt output. */
++            out_names[off] = '\0';
++            break;
++        }
++        off += written;
+     }
+     if (off > 0) out_names[off - 1] = '\0';
+-
+     rcu_read_unlock();
+     return off;
+ }
+ 
+ int get_module_info(const char *name, char *out_info, int size)
+ {
++    struct module *mod;
++    int sz;
++
+     if (size <= 0) return 0;
+     rcu_read_lock();
+ 
+-    struct module *mod = find_module(name);
+-    if (!mod) return -ENOENT;
++    mod = find_module(name);
++    if (!mod) {
++        rcu_read_unlock();
++        return -ENOENT;
++    }
+ 
+-    int sz = snprintf(out_info, size - 1,
+-                      "name=%s\n"
+-                      "version=%s\n"
+-                      "license=%s\n"
+-                      "author=%s\n"
+-                      "description=%s\n"
+-                      "args=%s\n",
+-                      mod->info.name, mod->info.version, mod->info.license, mod->info.author, mod->info.description,
+-                      mod->args);
++    sz = snprintf(out_info, size,
++                  "name=%s\n"
++                  "version=%s\n"
++                  "license=%s\n"
++                  "author=%s\n"
++                  "description=%s\n"
++                  "args=%s\n",
++                  mod->info.name, mod->info.version, mod->info.license, mod->info.author, mod->info.description,
++                  "<redacted>");
+ 
+-    if (sz > 0) out_info[sz - 1] = '\0';
+-    logkfd("%s", out_info);
++    if (sz < 0) {
++        out_info[0] = '\0';
++        sz = 0;
++    } else if (sz >= size) {
++        out_info[size - 1] = '\0';
++        sz = size - 1;
++    }
++    logkfd("module %s info (args redacted)\n", mod->info.name);
+ 
+     rcu_read_unlock();
+     return sz;
+@@ -662,4 +810,4 @@
+ {
+     INIT_LIST_HEAD(&modules.list);
+     spin_lock_init(&module_lock);
+-}
+\ No newline at end of file
++}
+diff --git a/kernel/patch/common/supercall.c b/kernel/patch/common/supercall.c
+--- a/kernel/patch/common/supercall.c
++++ b/kernel/patch/common/supercall.c
+@@ -100,23 +100,33 @@
+ static long call_kpm_list(char *__user names, int len)
+ {
+     if (len <= 0) return -EINVAL;
+     char buf[4096] = {0};
+     int sz = list_modules(buf, sizeof(buf));
+-    if (sz > len) return -ENOBUFS;
+-    sz = compat_copy_to_user(names, buf, len);
+-    return sz;
++    if (sz < 0) return sz;
++    if (sz > (int)sizeof(buf)) return -EOVERFLOW;
++    int copy_len = sz > 0 ? sz : 1;
++    if (buf[copy_len - 1] != '\0') return -EIO;
++    if (copy_len > len) return -ENOBUFS;
++    int copied = compat_copy_to_user(names, buf, copy_len);
++    return copied == copy_len ? sz : -EFAULT;
+ }
+ 
+ static long call_kpm_info(const char *__user uname, char *__user out_info, int out_len)
+ {
+     if (out_len <= 0) return -EINVAL;
+-    char name[64];
+-    char buf[2048];
++    char name[64] = {0};
++    char buf[2048] = {0};
+     int len = compat_strncpy_from_user(name, uname, sizeof(name));
+     if (len <= 0) return -EINVAL;
++    if (len >= (int)sizeof(name)) return -ENAMETOOLONG;
+     int sz = get_module_info(name, buf, sizeof(buf));
+     if (sz < 0) return sz;
+-    if (sz > out_len) return -ENOBUFS;
+-    sz = compat_copy_to_user(out_info, buf, sz);
+-    return sz;
++    /* snprintf may report the untruncated size. Never use it as a source
++     * length before validating against the actual initialized object. */
++    if (sz >= (int)sizeof(buf)) return -EOVERFLOW;
++    buf[sz] = '\0';
++    int copy_len = sz + 1;
++    if (copy_len > out_len) return -ENOBUFS;
++    int copied = compat_copy_to_user(out_info, buf, copy_len);
++    return copied == copy_len ? copy_len : -EFAULT;
+ }
+diff --git a/kernel/linux/include/linux/rcupdate.h b/kernel/linux/include/linux/rcupdate.h
+--- a/kernel/linux/include/linux/rcupdate.h
++++ b/kernel/linux/include/linux/rcupdate.h
+@@ -70,12 +70,13 @@
+ static inline void rcu_barrier_tasks_rude(void)
+ {
+     kfunc_call(rcu_barrier_tasks_rude)
+ }
+ static inline void synchronize_rcu(void)
+ {
+-    kfunc_call(rcu_barrier_tasks_rude)
++    /* Match the pointer resolved in ksyms/misc.c, not the unbound rude API. */
++    kfunc_call(synchronize_rcu);
+ }
+ static inline unsigned long get_completed_synchronize_rcu(void)
+ {
+     kfunc_call(get_completed_synchronize_rcu)
+ }

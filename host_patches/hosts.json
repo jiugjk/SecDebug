@@ -1,0 +1,19 @@
+{
+  "schema": 1,
+  "hosts": [
+    {
+      "fork": "KernelPatch",
+      "commit": "f36f3d1377004871f8c964f7cd3276712eeba943",
+      "module_blob": "d6f5f99143e70bca0be57fdf42afffb7ed28e6ab",
+      "patch": "bmax121-KernelPatch-f36f3d1.patch",
+      "patch_sha256": "6d5e0e650272eb4cf3315ee90ae8d27889a8b429e560c29dcdcac33a14e3d575"
+    },
+    {
+      "fork": "KPatch-Next",
+      "commit": "456744b29efb9989445463ab29e368fa59a103c4",
+      "module_blob": "087cd4bf5f43cc53216a46db409f6ee8fc7576fe",
+      "patch": "KernelSU-Next-KPatch-Next-456744b.patch",
+      "patch_sha256": "52035ea96c622075e3c5cf1f066b4129ee23ab7366d7cff40fcfab690a7be25f"
+    }
+  ]
+}

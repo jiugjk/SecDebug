@@ -6,10 +6,9 @@ import argparse
 import os
 from pathlib import Path
 import stat
-import subprocess
 import zipfile
 
-from host_contract import isolated_git_env
+from host_contract import git
 
 ROOT = Path(__file__).resolve().parents[1]
 EXCLUDE_DIRS = {'.git', 'build', 'dist', '__pycache__', '.pytest_cache'}
@@ -82,13 +81,11 @@ def release_paths(root: Path = ROOT) -> list[Path]:
     root = root.resolve()
     expected = list(RELEASE_FILES)
     if (root / '.git').exists():
-        proc = subprocess.run(['git', '-C', str(root), 'ls-files', '-z'],
-                              env=isolated_git_env(), stdout=subprocess.PIPE,
-                              stderr=subprocess.PIPE)
-        if proc.returncode:
-            raise RuntimeError('git ls-files failed: ' +
-                               proc.stderr.decode(errors='replace').strip())
-        tracked = sorted(os.fsdecode(raw) for raw in proc.stdout.split(b'\0') if raw)
+        try:
+            raw_out = git(root, 'ls-files', '-z')
+        except ValueError as exc:
+            raise RuntimeError(f'git ls-files failed: {exc}') from exc
+        tracked = sorted(os.fsdecode(raw) for raw in raw_out.split(b'\0') if raw)
         if tracked != expected:
             raise RuntimeError('tracked Git file list does not match RELEASE_FILES manifest')
     paths: list[Path] = []

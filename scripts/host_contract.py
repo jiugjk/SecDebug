@@ -22,6 +22,15 @@ MANIFEST = ROOT / 'host_patches/hosts.json'
 CONTRACT = '0x53440101'
 
 
+ISOLATED_GIT_CONFIG: tuple[str, ...] = (
+    '-c', 'core.fsmonitor=false',
+    '-c', 'core.hooksPath=/dev/null',
+    '-c', 'core.pager=cat',
+    '-c', 'core.autocrlf=false',
+    '-c', 'diff.external=',
+)
+
+
 def isolated_git_env() -> dict[str, str]:
     env = {k: v for k, v in os.environ.items() if not k.startswith('GIT_')}
     env.update(
@@ -29,12 +38,15 @@ def isolated_git_env() -> dict[str, str]:
         GIT_CONFIG_NOSYSTEM='1',
         GIT_CONFIG_GLOBAL='/dev/null',
         GIT_ATTR_NOSYSTEM='1',
+        GIT_TERMINAL_PROMPT='0',
     )
     return env
 
 
 def git(host: Path, *args: str) -> bytes:
-    proc = subprocess.run(['git', '-C', str(host), *args], env=isolated_git_env(),
+    proc = subprocess.run(['git', *ISOLATED_GIT_CONFIG, '--no-optional-locks',
+                           '-C', str(host), *args],
+                          env=isolated_git_env(),
                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if proc.returncode:
         raise ValueError(proc.stderr.decode(errors='replace').strip() or 'git command failed')
@@ -44,8 +56,9 @@ def git(host: Path, *args: str) -> bytes:
 def apply_patch_isolated(target: Path, patch: Path,
                          preimages: dict[str, bytes]) -> dict[str, bytes]:
     env = isolated_git_env()
-    init = subprocess.run(['git', 'init', '-q', '--template='], cwd=target,
-                          env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    init = subprocess.run(['git', *ISOLATED_GIT_CONFIG, 'init', '-q', '--template='],
+                          cwd=target, env=env,
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if init.returncode:
         raise ValueError('failed to initialize isolated patch tree: ' +
                          init.stderr.decode(errors='replace').strip())
@@ -53,7 +66,7 @@ def apply_patch_isolated(target: Path, patch: Path,
         file = target / name
         file.parent.mkdir(parents=True, exist_ok=True)
         file.write_bytes(raw)
-    proc = subprocess.run(['git', '-c', 'core.autocrlf=false', 'apply', str(patch.resolve())],
+    proc = subprocess.run(['git', *ISOLATED_GIT_CONFIG, 'apply', str(patch.resolve())],
                           cwd=target, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if proc.returncode:
         raise ValueError('approved patch does not apply to pinned source: ' +

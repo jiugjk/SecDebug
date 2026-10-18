@@ -230,13 +230,25 @@ sys.exit(0 if m.verify_kpm(sys.argv[2]) else 1)
         for rel in RELEASE_FILES:
             run(['git', 'add', '-f', rel], cwd=pack_copy)
         (pack_copy / '.gitignore').write_text((pack_copy / '.gitignore').read_text() + '\n.env\n')
+        fsmonitor_marker = base / 'malicious-fsmonitor-executed'
+        for repo_cfg in (host / '.git/config', pack_copy / '.git/config'):
+            repo_cfg.write_text(
+                repo_cfg.read_text() +
+                f'\n[core]\n\tfsmonitor = touch {shlex.quote(str(fsmonitor_marker))}\n'
+                f'\thooksPath = {shlex.quote(str(base / "evil-hooks"))}\n'
+                f'\tpager = touch {shlex.quote(str(fsmonitor_marker))}\n'
+                f'[diff]\n\texternal = touch {shlex.quote(str(fsmonitor_marker))}\n'
+            )
+        make('check-host-contract')
+        make('BUILD_DIR=' + str(base / 'output-malicious-cfg'))
         zip_with_git = base / 'SecDebug-from-git.zip'
         package(zip_with_git, root=pack_copy)
+        assert not fsmonitor_marker.exists()
         with zipfile.ZipFile(zip_with_git) as zf:
             assert zf.namelist() == [f'secdebug/{rel}' for rel in RELEASE_FILES]
             assert not any(name.endswith(('.env', 'notes.txt', 'core', 'dump.bin', 'extra.zip'))
                            for name in zf.namelist())
-        print('release source packaging excludes untracked/ignored local files with or without .git: PASS')
+        print('release source packaging excludes untracked/ignored local files and isolates local .git/config (fsmonitor/hooks/diff.external): PASS')
 
 
 if __name__ == '__main__':

@@ -13,7 +13,7 @@
  * this x86 host harness. No real kernel is modified or accessed. */
 #include "core_host_adapted.c"
 #include "../src/secdebug_mem.c"
-#include "../src/secdebug_session.c"
+#include "session_host_adapted.c"
 #include "hwbp_host_adapted.c"
 #define syscall audit_syscall
 #define getuid audit_getuid
@@ -35,7 +35,10 @@ static int allocations_under_rcu, frees_under_rcu, copies_under_rcu;
 static int fail_alloc, fail_close, fail_alloc_at, live_allocs, copy_fail;
 static int copy_result = 2147483647;
 static int pause_copy_fail_once;
+static int pause_reaper_liveness_once;
+static int reaper_reached_liveness;
 static pthread_barrier_t copy_race_entered, copy_race_resume;
+static pthread_barrier_t reaper_race_entered, reaper_race_resume;
 struct perf_event { int enabled; void *handler; void *context; };
 static struct perf_event *last_event;
 static int live_events, perf_error, perf_enables, perf_atomic_disables, hit_on_enable;
@@ -96,6 +99,12 @@ static void fake_mmput(struct mm_struct *mm)
 static pid_t fake_pid(struct task_struct *task, int type, void *ns)
 {
     int nr = type == SECDEBUG_PIDTYPE_TGID ? task->tgid : task->pid;
+    if (ns == &init_ns && current_task == &peer && task == &owner &&
+        __atomic_exchange_n(&pause_reaper_liveness_once, 0, __ATOMIC_ACQ_REL)) {
+        __atomic_store_n(&reaper_reached_liveness, 1, __ATOMIC_RELEASE);
+        pthread_barrier_wait(&reaper_race_entered);
+        pthread_barrier_wait(&reaper_race_resume);
+    }
     return ns == &init_ns ? nr : nr - namespace_shift;
 }
 static int fake_access(struct mm_struct *mm, unsigned long addr, void *buf,
@@ -352,55 +361,175 @@ static void *concurrent_bp_register_worker(void *arg)
     return NULL;
 }
 
-static void test_concurrent_create_rollback_leases(void)
+static void *concurrent_peer_session_worker(void *arg)
 {
-    pthread_t th;
-    int rc_a = 0;
+    int *rc_out = arg;
     struct secdebug_client client_b;
     char buf[1200];
     size_t done = 0;
+
+    current_task = &peer;
+    assert(secdebug_client_init(&client_b, NULL, 0x1234) == 0);
+    *rc_out = secdebug_read_mem(&client_b, 1234, 0x10000, buf, sizeof(buf), &done);
+    assert(*rc_out == (int)sizeof(buf) && done == sizeof(buf));
+    assert(secdebug_client_destroy(&client_b) == 0);
+    return NULL;
+}
+
+static void *concurrent_peer_bp_worker(void *arg)
+{
+    uint32_t *slot_out = arg;
+    struct secdebug_client client_b;
+
+    current_task = &peer;
+    assert(secdebug_client_init(&client_b, NULL, 0x1234) == 0);
+    assert(secdebug_register_bp(&client_b, 1234, SECDEBUG_BP_TYPE_WRITE, 0x10000, 8, slot_out) == 0);
+    assert(*slot_out != 0);
+    assert(secdebug_client_destroy(&client_b) == 0);
+    return NULL;
+}
+
+static int active_session_count(void)
+{
+    int n = 0;
+    for (int i = 0; i < SECDEBUG_MAX_MEM_SESSIONS; ++i) {
+        uint32_t st = session_status(__atomic_load_n(&g_sessions[i].lifecycle, __ATOMIC_ACQUIRE));
+        if (st != SESSION_FREE)
+            ++n;
+    }
+    return n;
+}
+
+static void test_concurrent_create_rollback_leases(void)
+{
+    pthread_t th_a, th_b;
+    int rc_a = 0, rc_b = 0;
     uint32_t slot_b = 0;
+    struct secdebug_client client_b;
 
     assert(!pthread_barrier_init(&copy_race_entered, NULL, 2));
     assert(!pthread_barrier_init(&copy_race_resume, NULL, 2));
+    assert(!pthread_barrier_init(&reaper_race_entered, NULL, 2));
+    assert(!pthread_barrier_init(&reaper_race_resume, NULL, 2));
 
-    /* Session OPEN: A fails response copy while B runs another OPEN+reap+CLOSE. */
+    /* Session OPEN: A is paused inside compat_copy_to_user before failing.
+     * In the fixed implementation, A's slot stays SESSION_BUSY during copy,
+     * so B's reaper skips A's slot and never reaches fake_pid liveness check.
+     * In the legacy pre-SD-02 implementation, A published SESSION_ACTIVE early,
+     * so B's reaper claims SESSION_BUSY and pauses at reaper_race_entered while
+     * A resumes and attempts rollback CLOSE concurrently against B's BUSY lease. */
     __atomic_store_n(&pause_copy_fail_once, 1, __ATOMIC_RELEASE);
-    assert(!pthread_create(&th, NULL, concurrent_session_open_worker, &rc_a));
+    __atomic_store_n(&pause_reaper_liveness_once, 1, __ATOMIC_RELEASE);
+    __atomic_store_n(&reaper_reached_liveness, 0, __ATOMIC_RELEASE);
+    assert(!pthread_create(&th_a, NULL, concurrent_session_open_worker, &rc_a));
     pthread_barrier_wait(&copy_race_entered);
-    current_task = &peer;
-    assert(secdebug_client_init(&client_b, NULL, 0x1234) == 0);
-    assert(secdebug_read_mem(&client_b, 1234, 0x10000, buf, sizeof(buf), &done) == (int)sizeof(buf));
-    assert(done == sizeof(buf) && secdebug_client_destroy(&client_b) == 0);
+#ifndef SECDEBUG_LEGACY_PRE_SD02_RACE
+    {
+        int busy_slots = 0;
+        uint32_t id_a = 0;
+        for (int i = 0; i < SECDEBUG_MAX_MEM_SESSIONS; ++i) {
+            uint64_t life = __atomic_load_n(&g_sessions[i].lifecycle, __ATOMIC_ACQUIRE);
+            if (session_status(life) != SESSION_FREE) {
+                assert(session_status(life) == SESSION_BUSY);
+                id_a = session_id(life);
+                ++busy_slots;
+            }
+        }
+        assert(busy_slots == 1 && id_a != 0);
+        /* Public close/read cannot steal or observe A's uncommitted creation lease. */
+        assert(secdebug_session_close(id_a) == -EBUSY);
+    }
+#endif
+    assert(!pthread_create(&th_b, NULL, concurrent_peer_session_worker, &rc_b));
+#ifdef SECDEBUG_LEGACY_PRE_SD02_RACE
+    pthread_barrier_wait(&reaper_race_entered);
+    assert(__atomic_load_n(&reaper_reached_liveness, __ATOMIC_ACQUIRE) == 1);
     pthread_barrier_wait(&copy_race_resume);
-    assert(!pthread_join(th, NULL));
+    assert(!pthread_join(th_a, NULL));
+    pthread_barrier_wait(&reaper_race_resume);
+    assert(!pthread_join(th_b, NULL));
+#else
+    assert(!pthread_join(th_b, NULL));
+    assert(__atomic_load_n(&reaper_reached_liveness, __ATOMIC_ACQUIRE) == 0);
+    __atomic_store_n(&pause_reaper_liveness_once, 0, __ATOMIC_RELEASE);
+    pthread_barrier_wait(&copy_race_resume);
+    assert(!pthread_join(th_a, NULL));
+#endif
     current_task = &owner;
-    assert(rc_a == -EINPROGRESS);
-    assert(target_mm.refs == 0 && owner.refs == 0 && peer.refs == 0 && live_allocs == 0);
-    for (int i = 0; i < SECDEBUG_MAX_MEM_SESSIONS; ++i)
-        assert(session_status(__atomic_load_n(&g_sessions[i].lifecycle, __ATOMIC_ACQUIRE)) == SESSION_FREE);
+    assert(rc_a == -EINPROGRESS && rc_b == 1200);
+#ifdef SECDEBUG_LEGACY_PRE_SD02_RACE
+    assert(active_session_count() == 1 && target_mm.refs == 1 && owner.refs == 1 && peer.refs == 0);
+    secdebug_session_cleanup();
+#endif
+    assert(active_session_count() == 0 && target_mm.refs == 0 && owner.refs == 0 && peer.refs == 0);
+    assert(live_allocs == 0);
 
-    /* Breakpoint REGISTER: A fails response copy while B registers and unregisters. */
+    /* Breakpoint REGISTER: same exact overlap test between A's failed copy/rollback
+     * and B's reaper BUSY lease. */
     __atomic_store_n(&pause_copy_fail_once, 1, __ATOMIC_RELEASE);
+    __atomic_store_n(&pause_reaper_liveness_once, 1, __ATOMIC_RELEASE);
+    __atomic_store_n(&reaper_reached_liveness, 0, __ATOMIC_RELEASE);
     rc_a = 0;
-    assert(!pthread_create(&th, NULL, concurrent_bp_register_worker, &rc_a));
+    slot_b = 0;
+    assert(!pthread_create(&th_a, NULL, concurrent_bp_register_worker, &rc_a));
     pthread_barrier_wait(&copy_race_entered);
+#ifndef SECDEBUG_LEGACY_PRE_SD02_RACE
+    {
+        int busy_slots = 0;
+        uint32_t id_a = 0;
+        for (int i = 0; i < SECDEBUG_MAX_BP_SLOTS; ++i) {
+            uint64_t life = __atomic_load_n(&g_bp_slots[i].lifecycle, __ATOMIC_ACQUIRE);
+            if (slot_lifecycle_state(life) != BP_SLOT_FREE) {
+                assert(slot_lifecycle_state(life) == BP_SLOT_BUSY);
+                id_a = slot_lifecycle_id(life);
+                ++busy_slots;
+            }
+        }
+        assert(busy_slots == 1 && id_a != 0);
+        struct secdebug_bp_unreg_req unreg_a = { .slot_id = id_a };
+        assert(secdebug_hwbp_unregister(&unreg_a) == -EBUSY);
+    }
+#endif
+    assert(!pthread_create(&th_b, NULL, concurrent_peer_bp_worker, &slot_b));
+#ifdef SECDEBUG_LEGACY_PRE_SD02_RACE
+    pthread_barrier_wait(&reaper_race_entered);
+    assert(__atomic_load_n(&reaper_reached_liveness, __ATOMIC_ACQUIRE) == 1);
+    pthread_barrier_wait(&copy_race_resume);
+    assert(!pthread_join(th_a, NULL));
+    pthread_barrier_wait(&reaper_race_resume);
+    assert(!pthread_join(th_b, NULL));
+#else
+    assert(!pthread_join(th_b, NULL));
+    assert(__atomic_load_n(&reaper_reached_liveness, __ATOMIC_ACQUIRE) == 0);
+    __atomic_store_n(&pause_reaper_liveness_once, 0, __ATOMIC_RELEASE);
+    pthread_barrier_wait(&copy_race_resume);
+    assert(!pthread_join(th_a, NULL));
+#endif
+    assert(rc_a == -EINPROGRESS && slot_b != 0);
     current_task = &peer;
     assert(secdebug_client_init(&client_b, NULL, 0x1234) == 0);
-    assert(secdebug_register_bp(&client_b, 1234, SECDEBUG_BP_TYPE_WRITE, 0x10000, 8, &slot_b) == 0);
-    assert(slot_b != 0 && secdebug_hwbp_active_count() == 2);
-    pthread_barrier_wait(&copy_race_resume);
-    assert(!pthread_join(th, NULL));
-    assert(rc_a == -EINPROGRESS);
-    assert(secdebug_hwbp_active_count() == 1 && live_events == 1 && owner.refs == 1);
     assert(secdebug_unregister_bp(&client_b, slot_b) == 0);
     assert(secdebug_client_destroy(&client_b) == 0);
     current_task = &owner;
-    assert(secdebug_hwbp_active_count() == 0 && live_events == 0);
-    assert(target_mm.refs == 0 && owner.refs == 0 && peer.refs == 0 && live_allocs == 0);
+#ifdef SECDEBUG_LEGACY_PRE_SD02_RACE
+    assert(secdebug_hwbp_active_count() == 1 && live_events == 1 && owner.refs == 3 && peer.refs == 0);
+    secdebug_hwbp_cleanup();
+    assert(secdebug_hwbp_active_count() == 0 && live_events == 0 && owner.refs == 0 && peer.refs == 0);
+    assert(target_mm.refs == 0 && live_allocs == 0);
+    assert(!pthread_barrier_destroy(&copy_race_entered));
+    assert(!pthread_barrier_destroy(&copy_race_resume));
+    assert(!pthread_barrier_destroy(&reaper_race_entered));
+    assert(!pthread_barrier_destroy(&reaper_race_resume));
+    fprintf(stderr, "SD-02 session and breakpoint races reproduced in legacy mode\n");
+    exit(77);
+#endif
+    assert(secdebug_hwbp_active_count() == 0 && live_events == 0 && owner.refs == 0 && peer.refs == 0);
+    assert(target_mm.refs == 0 && live_allocs == 0);
 
     assert(!pthread_barrier_destroy(&copy_race_entered));
     assert(!pthread_barrier_destroy(&copy_race_resume));
+    assert(!pthread_barrier_destroy(&reaper_race_entered));
+    assert(!pthread_barrier_destroy(&reaper_race_resume));
     puts("Concurrent session OPEN and breakpoint REGISTER rollback leases against reaper: PASS");
 }
 static pthread_barrier_t gate_ready, gate_go;
@@ -425,6 +554,7 @@ static void test_quiescent_cleanup_and_gate(void)
     struct secdebug_session_open_resp resp;
     fake_lock();
     assert(secdebug_session_open(&req, &resp) == 0);
+    secdebug_session_finish_open(resp.session_id, 1);
     assert(rcu_depth == 1);
     fake_unlock();
     struct secdebug_mem_session *slot = &g_sessions[resp.session_id & (SECDEBUG_MAX_MEM_SESSIONS - 1)];

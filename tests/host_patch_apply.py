@@ -13,7 +13,7 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'scripts'))
-from host_contract import apply_patch_isolated, isolated_git_env
+from host_contract import ISOLATED_GIT_CONFIG, apply_patch_isolated, isolated_git_env
 PATCHES = sorted((ROOT/'host_patches').glob('*.patch'))
 HUNK = re.compile(r'^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@')
 
@@ -67,12 +67,13 @@ def main():
             tmp = Path(td)
             raw_preimages = {name: text.encode('utf-8') for name, text in preimages(patch).items()}
             env = isolated_git_env()
-            subprocess.run(['git', 'init', '-q', '--template='], cwd=tmp, env=env, check=True)
+            subprocess.run(['git', *ISOLATED_GIT_CONFIG, 'init', '-q', '--template='],
+                           cwd=tmp, env=env, check=True)
             for name, raw in raw_preimages.items():
                 file = tmp / name
                 file.parent.mkdir(parents=True, exist_ok=True)
                 file.write_bytes(raw)
-            subprocess.run(['git', '-c', 'core.autocrlf=false', 'apply', '--check', str(patch)],
+            subprocess.run(['git', *ISOLATED_GIT_CONFIG, 'apply', '--check', str(patch)],
                            cwd=tmp, env=env, check=True)
         with tempfile.TemporaryDirectory(prefix='secdebug-patch-fixture-') as td:
             tmp = Path(td)

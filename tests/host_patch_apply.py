@@ -8,9 +8,12 @@ host checkout (the original module.c/module.h Git objects are not bundled).
 from pathlib import Path
 import re
 import subprocess
+import sys
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / 'scripts'))
+from host_contract import apply_patch_isolated, isolated_git_env
 PATCHES = sorted((ROOT/'host_patches').glob('*.patch'))
 HUNK = re.compile(r'^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@')
 
@@ -62,13 +65,20 @@ def main():
     for patch in PATCHES:
         with tempfile.TemporaryDirectory(prefix='secdebug-patch-fixture-') as td:
             tmp = Path(td)
-            for name, text in preimages(patch).items():
-                file = tmp/name
+            raw_preimages = {name: text.encode('utf-8') for name, text in preimages(patch).items()}
+            env = isolated_git_env()
+            subprocess.run(['git', 'init', '-q', '--template='], cwd=tmp, env=env, check=True)
+            for name, raw in raw_preimages.items():
+                file = tmp / name
                 file.parent.mkdir(parents=True, exist_ok=True)
-                file.write_text(text)
-            subprocess.run(['git', 'apply', '--check', str(patch)], cwd=tmp, check=True)
-            subprocess.run(['git', 'apply', str(patch)], cwd=tmp, check=True)
-            patched = (tmp/'kernel/patch/module/module.c').read_text()
+                file.write_bytes(raw)
+            subprocess.run(['git', '-c', 'core.autocrlf=false', 'apply', '--check', str(patch)],
+                           cwd=tmp, env=env, check=True)
+        with tempfile.TemporaryDirectory(prefix='secdebug-patch-fixture-') as td:
+            tmp = Path(td)
+            raw_preimages = {name: text.encode('utf-8') for name, text in preimages(patch).items()}
+            patched_files = apply_patch_isolated(tmp, patch, raw_preimages)
+            patched = patched_files['kernel/patch/module/module.c'].decode('utf-8')
             assert 'if (remaining <= 1)' in patched
             assert 'written >= remaining' in patched
             assert 'size - 1 - off' not in patched

@@ -12,7 +12,7 @@ import subprocess
 import sys
 import tempfile
 
-from host_contract import verify_host, validate_build_inputs
+from host_contract import git, verify_host, validate_build_inputs
 
 ROOT = Path(__file__).resolve().parents[1]
 FIELDS = ('KP_DIR', 'HOST_COMMIT', 'TARGET_ARCH', 'KPM_TUNE', 'TARGET_PAGE_SHIFT',
@@ -45,15 +45,14 @@ def configuration():
     host = Path(fields['KP_DIR']).resolve()
     fields['KP_DIR'] = str(host)
     contract = verify_host(host, fields['HOST_COMMIT'])
-    git = ['git', '-C', str(host)]
-    actual = subprocess.check_output([*git, 'rev-parse', 'HEAD'], text=True).strip()
+    actual = git(host, 'rev-parse', 'HEAD').decode().strip()
     if actual != fields['HOST_COMMIT']:
         raise ValueError('host commit changed during build')
     # Includes staged and unstaged changes to loader sources and headers.
-    digest = hashlib.sha256(subprocess.check_output([*git, 'diff', '--no-ext-diff',
-                                                   '--binary', 'HEAD', '--', 'kernel']))
-    untracked = subprocess.check_output([*git, 'ls-files', '--others',
-                                        '--exclude-standard', '-z', '--', 'kernel'])
+    digest = hashlib.sha256(git(host, 'diff', '--no-ext-diff',
+                                '--binary', 'HEAD', '--', 'kernel'))
+    untracked = git(host, 'ls-files', '--others',
+                    '--exclude-standard', '-z', '--', 'kernel')
     for raw in sorted(filter(None, untracked.split(b'\0'))):
         digest.update(raw + b'\0')
         digest.update(hashlib.sha256((host / os.fsdecode(raw)).read_bytes()).digest())

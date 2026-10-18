@@ -28,6 +28,16 @@ def run(args, cwd=ROOT, env=None, success=True):
     return result
 
 
+def copy_release_tree(destination: Path) -> None:
+    sys.path.insert(0, str(ROOT / 'scripts'))
+    from package_source import RELEASE_FILES
+    for rel in RELEASE_FILES:
+        src = ROOT / rel
+        dst = destination / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dst)
+
+
 COMPILER = r'''#!/usr/bin/env python3
 import os, pathlib, subprocess, sys
 if sys.argv[1:] == ['--version']:
@@ -82,8 +92,7 @@ def main():
         print('production allow-list rejects synthetic/arbitrary Git HEAD: PASS')
 
         project = base / 'project'
-        shutil.copytree(ROOT, project,
-                        ignore=shutil.ignore_patterns('build', 'dist', '.git', '__pycache__'))
+        copy_release_tree(project)
         manifest = project / 'host_patches/hosts.json'
         spec = next(x for x in json.loads(manifest.read_text())['hosts'] if x['patch'] == patch_name)
         spec['commit'] = sha
@@ -101,7 +110,16 @@ def main():
 
         denied = make('check-host-contract', success=False)
         assert denied.returncode and 'host source mismatch' in denied.stderr and compiles() == 0
-        print('known baseline without safety patch is rejected before compilation: PASS')
+        nested_tmp = project / 'build-tmp-inside-git'
+        nested_tmp.mkdir()
+        run(['git', 'init', '-q', str(project)])
+        nested_env = dict(env, TMPDIR=str(nested_tmp), GIT_DIR=str(project / '.git'),
+                          GIT_WORK_TREE=str(project))
+        denied_nested = make('check-host-contract', success=False, environment=nested_env)
+        assert denied_nested.returncode and 'host source mismatch' in denied_nested.stderr and compiles() == 0
+        shutil.rmtree(nested_tmp)
+        shutil.rmtree(project / '.git')
+        print('known baseline without safety patch is rejected before compilation (including nested-Git TMPDIR): PASS')
         run(['sh', str(project / 'host_patches/apply_checked.sh'), str(host), 'KernelPatch', '--check'], env=env)
         run(['sh', str(project / 'host_patches/apply_checked.sh'), str(host), 'KernelPatch', '--apply'], env=env)
         make('check-host-contract')
@@ -196,6 +214,29 @@ sys.exit(0 if m.verify_kpm(sys.argv[2]) else 1)
             if not accepted:
                 assert symbol in result.stdout and '[...]' not in result.stdout
         print('GNU readelf accepts allowed long symbol and rejects forbidden long symbol: PASS')
+
+        import zipfile
+        sys.path.insert(0, str(ROOT / 'scripts'))
+        from package_source import RELEASE_FILES, package
+        pack_copy = base / 'pack_copy'
+        copy_release_tree(pack_copy)
+        for noisy in ('.env', 'notes.txt', 'core', 'dump.bin', 'extra.zip'):
+            (pack_copy / noisy).write_text('synthetic local artifact for packaging test\n')
+        zip_no_git = base / 'SecDebug-from-tarball.zip'
+        package(zip_no_git, root=pack_copy)
+        with zipfile.ZipFile(zip_no_git) as zf:
+            assert zf.namelist() == [f'secdebug/{rel}' for rel in RELEASE_FILES]
+        run(['git', 'init', '-q', str(pack_copy)])
+        for rel in RELEASE_FILES:
+            run(['git', 'add', '-f', rel], cwd=pack_copy)
+        (pack_copy / '.gitignore').write_text((pack_copy / '.gitignore').read_text() + '\n.env\n')
+        zip_with_git = base / 'SecDebug-from-git.zip'
+        package(zip_with_git, root=pack_copy)
+        with zipfile.ZipFile(zip_with_git) as zf:
+            assert zf.namelist() == [f'secdebug/{rel}' for rel in RELEASE_FILES]
+            assert not any(name.endswith(('.env', 'notes.txt', 'core', 'dump.bin', 'extra.zip'))
+                           for name in zf.namelist())
+        print('release source packaging excludes untracked/ignored local files with or without .git: PASS')
 
 
 if __name__ == '__main__':

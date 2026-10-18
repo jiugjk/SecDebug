@@ -625,7 +625,9 @@ int secdebug_hwbp_register(const struct secdebug_bp_reg_req *req, struct secdebu
         int err = event ? (int)PTR_ERR(event) : -EINVAL;
 
         if (err == -ENODEV || err == -ENOSYS || err == -EOPNOTSUPP || err == -ENOENT) {
-            g_cap_flags &= ~(SECDEBUG_CAP_HW_BREAK | SECDEBUG_CAP_HW_WATCH);
+            __atomic_fetch_and(&g_cap_flags,
+                               ~(uint32_t)(SECDEBUG_CAP_HW_BREAK | SECDEBUG_CAP_HW_WATCH),
+                               __ATOMIC_RELEASE);
             printk("secdebug: breakpoint create failed (%d); HW caps cleared\n", err);
         }
         slot->owner = NULL;
@@ -649,14 +651,40 @@ int secdebug_hwbp_register(const struct secdebug_bp_reg_req *req, struct secdebu
     __atomic_store_n(&slot->lifecycle, slot_lifecycle(public_id, BP_SLOT_BUSY),
                      __ATOMIC_RELEASE);
 
-    /* A hardware hit during enable is already supported in the BUSY state. */
+    /* A hardware hit during enable is already supported in the BUSY state.
+     * Keep BP_SLOT_BUSY until finish_register() commits or rolls back. */
     g_syms.perf_event_enable(event);
-    __atomic_store_n(&slot->lifecycle, slot_lifecycle(public_id, BP_SLOT_ACTIVE),
-                     __ATOMIC_RELEASE);
     resp->slot_id = public_id;
     resp->reserved = 0;
     secdebug_rcu_restore(&rcu_dropped);
     return 0;
+}
+
+void secdebug_hwbp_finish_register(uint32_t slot_id, int delivered)
+{
+    int idx;
+    int rcu_dropped = 0;
+    struct bp_slot *slot;
+    uint64_t expected;
+
+    idx = slot_index_from_id(slot_id);
+    if (idx < 0)
+        return;
+    slot = &g_bp_slots[idx];
+    expected = slot_lifecycle(slot_id, BP_SLOT_BUSY);
+    if (delivered) {
+        __atomic_compare_exchange_n(&slot->lifecycle, &expected,
+                                    slot_lifecycle(slot_id, BP_SLOT_ACTIVE), 0,
+                                    __ATOMIC_RELEASE, __ATOMIC_RELAXED);
+        return;
+    }
+    if (!__atomic_compare_exchange_n(&slot->lifecycle, &expected,
+                                     slot_lifecycle(slot_id, BP_SLOT_DRAINING), 0,
+                                     __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
+        return;
+    secdebug_rcu_drop(&rcu_dropped);
+    slot_quiesce(slot);
+    secdebug_rcu_restore(&rcu_dropped);
 }
 
 int secdebug_hwbp_unregister(const struct secdebug_bp_unreg_req *req)

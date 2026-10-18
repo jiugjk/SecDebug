@@ -128,6 +128,8 @@ void secdebug_session_cleanup(void);
 int secdebug_session_ready(void);
 int secdebug_session_open(const struct secdebug_session_open_req *req,
                           struct secdebug_session_open_resp *resp);
+/* open() holds SESSION_BUSY on success; finish_open() MUST run. */
+void secdebug_session_finish_open(uint32_t id, int delivered);
 int secdebug_session_read(const struct secdebug_session_read_req *req,
                           void *out, uint32_t *len);
 int secdebug_session_write(const struct secdebug_session_write_req *req,
@@ -140,6 +142,8 @@ int secdebug_session_close(uint32_t id);
 int secdebug_hwbp_init(void);
 void secdebug_hwbp_cleanup(void);
 int secdebug_hwbp_register(const struct secdebug_bp_reg_req *req, struct secdebug_bp_reg_resp *resp);
+/* register() holds BP_SLOT_BUSY on success; finish_register() MUST run. */
+void secdebug_hwbp_finish_register(uint32_t slot_id, int delivered);
 int secdebug_hwbp_unregister(const struct secdebug_bp_unreg_req *req);
 int secdebug_hwbp_get_hit(const struct secdebug_bp_hit_req *req, struct secdebug_bp_hit_resp *resp,
                           uint64_t *snapshot_total);

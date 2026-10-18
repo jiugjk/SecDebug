@@ -26,12 +26,16 @@ struct task_struct { unsigned refs; int pid; struct mm_struct *mm; int tgid; };
 static struct mm_struct target_mm;
 static struct task_struct owner = {0, 1234, &target_mm, 1234};
 static struct task_struct worker = {0, 1235, &target_mm, 1234};
-static struct task_struct *current_task = &owner;
+static struct task_struct peer = {0, 2234, &target_mm, 2234};
+static _Thread_local struct task_struct *current_task = &owner;
 static int namespace_shift;
 static int init_ns;
-static int rcu_depth, allocations_under_rcu, frees_under_rcu, copies_under_rcu;
+static _Thread_local int rcu_depth;
+static int allocations_under_rcu, frees_under_rcu, copies_under_rcu;
 static int fail_alloc, fail_close, fail_alloc_at, live_allocs, copy_fail;
 static int copy_result = 2147483647;
+static int pause_copy_fail_once;
+static pthread_barrier_t copy_race_entered, copy_race_resume;
 struct perf_event { int enabled; void *handler; void *context; };
 static struct perf_event *last_event;
 static int live_events, perf_error, perf_enables, perf_atomic_disables, hit_on_enable;
@@ -43,39 +47,52 @@ static void fake_lock(void) { ++rcu_depth; }
 static void fake_unlock(void) { assert(rcu_depth > 0); --rcu_depth; }
 static void *fake_vmalloc(unsigned long size)
 {
-    if (rcu_depth) ++allocations_under_rcu;
+    if (rcu_depth) __atomic_add_fetch(&allocations_under_rcu, 1, __ATOMIC_RELAXED);
     if (fail_alloc || (fail_alloc_at > 0 && --fail_alloc_at == 0)) return NULL;
     void *p = calloc(1, size);
-    if (p) ++live_allocs;
+    if (p) __atomic_add_fetch(&live_allocs, 1, __ATOMIC_RELAXED);
     return p;
 }
 static void fake_kvfree(const void *ptr)
 {
-    if (rcu_depth) ++frees_under_rcu;
-    --live_allocs;
-    assert(live_allocs >= 0);
+    if (rcu_depth) __atomic_add_fetch(&frees_under_rcu, 1, __ATOMIC_RELAXED);
+    int left = __atomic_sub_fetch(&live_allocs, 1, __ATOMIC_RELAXED);
+    assert(left >= 0);
     free((void *)ptr);
 }
 static struct task_struct *fake_find(pid_t pid)
 {
     if (pid == owner.pid - namespace_shift) return &owner;
     if (pid == worker.pid - namespace_shift) return &worker;
+    if (pid == peer.pid - namespace_shift) return &peer;
     return NULL;
 }
-static struct task_struct *fake_get(struct task_struct *task) { ++task->refs; return task; }
+static struct task_struct *fake_get(struct task_struct *task)
+{
+    __atomic_add_fetch(&task->refs, 1, __ATOMIC_RELAXED);
+    return task;
+}
 static struct task_struct *fake_find_get(pid_t pid)
 {
     struct task_struct *task = fake_find(pid);
     return task ? fake_get(task) : NULL;
 }
-static void fake_put(struct task_struct *task) { assert(task->refs); --task->refs; }
+static void fake_put(struct task_struct *task)
+{
+    unsigned prev = __atomic_fetch_sub(&task->refs, 1, __ATOMIC_RELAXED);
+    assert(prev > 0);
+}
 static struct mm_struct *fake_get_mm(struct task_struct *task)
 {
     if (!task->mm) return NULL;
-    ++task->mm->refs;
+    __atomic_add_fetch(&task->mm->refs, 1, __ATOMIC_RELAXED);
     return task->mm;
 }
-static void fake_mmput(struct mm_struct *mm) { assert(mm->refs); --mm->refs; }
+static void fake_mmput(struct mm_struct *mm)
+{
+    unsigned prev = __atomic_fetch_sub(&mm->refs, 1, __ATOMIC_RELAXED);
+    assert(prev > 0);
+}
 static pid_t fake_pid(struct task_struct *task, int type, void *ns)
 {
     int nr = type == SECDEBUG_PIDTYPE_TGID ? task->tgid : task->pid;
@@ -101,14 +118,14 @@ static struct perf_event *fake_perf_create(struct perf_event_attr *raw, int cpu,
     assert(event);
     event->handler = handler;
     event->context = context;
-    ++live_events;
+    __atomic_add_fetch(&live_events, 1, __ATOMIC_RELAXED);
     last_event = event;
     return event;
 }
 static void fake_perf_enable(struct perf_event *event)
 {
     assert(rcu_depth == 0);
-    ++perf_enables;
+    __atomic_add_fetch(&perf_enables, 1, __ATOMIC_RELAXED);
     event->enabled = 1;
     if (hit_on_enable) {
         struct bp_slot *slot = event->context;
@@ -127,24 +144,30 @@ static void fake_perf_disable(struct perf_event *event)
 }
 static void fake_perf_disable_atomic(struct perf_event *event)
 {
-    ++perf_atomic_disables;
+    __atomic_add_fetch(&perf_atomic_disables, 1, __ATOMIC_RELAXED);
     event->enabled = 0;
 }
 static void fake_perf_release(struct perf_event *event)
 {
-    assert(rcu_depth == 0 && live_events > 0);
-    --live_events;
+    assert(rcu_depth == 0);
+    int left = __atomic_sub_fetch(&live_events, 1, __ATOMIC_RELAXED);
+    assert(left >= 0);
     if (event == last_event) last_event = NULL;
     free(event);
 }
-struct task_struct *get_current(void) { return current_task; }
+struct task_struct *get_current(void) { return current_task ? current_task : &owner; }
 uid_t current_uid(void) { return 0; }
 uid_t audit_getuid(void) { return 0; }
 int is_su_allow_uid(uid_t uid) { (void)uid; return 0; }
 int printk(const char *fmt, ...) { (void)fmt; return 0; }
 int compat_copy_to_user(void *dst, const void *src, int n)
 {
-    if (rcu_depth) ++copies_under_rcu;
+    if (rcu_depth) __atomic_add_fetch(&copies_under_rcu, 1, __ATOMIC_RELAXED);
+    if (__atomic_exchange_n(&pause_copy_fail_once, 0, __ATOMIC_ACQ_REL)) {
+        pthread_barrier_wait(&copy_race_entered);
+        pthread_barrier_wait(&copy_race_resume);
+        return 0;
+    }
     if (copy_fail) { --copy_fail; return 0; }
     if (copy_result != 2147483647) {
         int result = copy_result;
@@ -298,6 +321,88 @@ static void test_namespace_worker(struct secdebug_client *client)
     namespace_shift = 0;
     puts("Nested PID namespace model: non-leader registration and stable-mm multi-block read: PASS");
 }
+
+static void *concurrent_session_open_worker(void *arg)
+{
+    int *rc_out = arg;
+    struct secdebug_client client_a;
+    char buf[1200];
+    size_t done = 0;
+
+    current_task = &owner;
+    assert(secdebug_client_init(&client_a, NULL, 0x1234) == 0);
+    *rc_out = secdebug_read_mem(&client_a, 1234, 0x10000, buf, sizeof(buf), &done);
+    assert(done == 0 && client_a.pending_session_id == 0);
+    assert(secdebug_client_cleanup_error(&client_a) == 0);
+    assert(secdebug_client_destroy(&client_a) == 0);
+    return NULL;
+}
+
+static void *concurrent_bp_register_worker(void *arg)
+{
+    int *rc_out = arg;
+    struct secdebug_client client_a;
+    uint32_t slot_a = 0;
+
+    current_task = &owner;
+    assert(secdebug_client_init(&client_a, NULL, 0x1234) == 0);
+    *rc_out = secdebug_register_bp(&client_a, 1234, SECDEBUG_BP_TYPE_EXEC, 0x10000, 4, &slot_a);
+    assert(slot_a == 0);
+    assert(secdebug_client_destroy(&client_a) == 0);
+    return NULL;
+}
+
+static void test_concurrent_create_rollback_leases(void)
+{
+    pthread_t th;
+    int rc_a = 0;
+    struct secdebug_client client_b;
+    char buf[1200];
+    size_t done = 0;
+    uint32_t slot_b = 0;
+
+    assert(!pthread_barrier_init(&copy_race_entered, NULL, 2));
+    assert(!pthread_barrier_init(&copy_race_resume, NULL, 2));
+
+    /* Session OPEN: A fails response copy while B runs another OPEN+reap+CLOSE. */
+    __atomic_store_n(&pause_copy_fail_once, 1, __ATOMIC_RELEASE);
+    assert(!pthread_create(&th, NULL, concurrent_session_open_worker, &rc_a));
+    pthread_barrier_wait(&copy_race_entered);
+    current_task = &peer;
+    assert(secdebug_client_init(&client_b, NULL, 0x1234) == 0);
+    assert(secdebug_read_mem(&client_b, 1234, 0x10000, buf, sizeof(buf), &done) == (int)sizeof(buf));
+    assert(done == sizeof(buf) && secdebug_client_destroy(&client_b) == 0);
+    pthread_barrier_wait(&copy_race_resume);
+    assert(!pthread_join(th, NULL));
+    current_task = &owner;
+    assert(rc_a == -EINPROGRESS);
+    assert(target_mm.refs == 0 && owner.refs == 0 && peer.refs == 0 && live_allocs == 0);
+    for (int i = 0; i < SECDEBUG_MAX_MEM_SESSIONS; ++i)
+        assert(session_status(__atomic_load_n(&g_sessions[i].lifecycle, __ATOMIC_ACQUIRE)) == SESSION_FREE);
+
+    /* Breakpoint REGISTER: A fails response copy while B registers and unregisters. */
+    __atomic_store_n(&pause_copy_fail_once, 1, __ATOMIC_RELEASE);
+    rc_a = 0;
+    assert(!pthread_create(&th, NULL, concurrent_bp_register_worker, &rc_a));
+    pthread_barrier_wait(&copy_race_entered);
+    current_task = &peer;
+    assert(secdebug_client_init(&client_b, NULL, 0x1234) == 0);
+    assert(secdebug_register_bp(&client_b, 1234, SECDEBUG_BP_TYPE_WRITE, 0x10000, 8, &slot_b) == 0);
+    assert(slot_b != 0 && secdebug_hwbp_active_count() == 2);
+    pthread_barrier_wait(&copy_race_resume);
+    assert(!pthread_join(th, NULL));
+    assert(rc_a == -EINPROGRESS);
+    assert(secdebug_hwbp_active_count() == 1 && live_events == 1 && owner.refs == 1);
+    assert(secdebug_unregister_bp(&client_b, slot_b) == 0);
+    assert(secdebug_client_destroy(&client_b) == 0);
+    current_task = &owner;
+    assert(secdebug_hwbp_active_count() == 0 && live_events == 0);
+    assert(target_mm.refs == 0 && owner.refs == 0 && peer.refs == 0 && live_allocs == 0);
+
+    assert(!pthread_barrier_destroy(&copy_race_entered));
+    assert(!pthread_barrier_destroy(&copy_race_resume));
+    puts("Concurrent session OPEN and breakpoint REGISTER rollback leases against reaper: PASS");
+}
 static pthread_barrier_t gate_ready, gate_go;
 static void *gate_worker(void *unused)
 {
@@ -404,6 +509,7 @@ int main(void)
 
     test_breakpoints(&client);
     test_namespace_worker(&client);
+    test_concurrent_create_rollback_leases();
 
     unsigned random = 0x93112512u;
     unsigned char decoded[1024];

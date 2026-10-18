@@ -183,7 +183,8 @@ int secdebug_session_open(const struct secdebug_session_open_req *req,
     slot->owner_init_pid = secdebug_init_pid(owner, 0);
     if (slot->owner_init_pid < 0)
         slot->owner_init_pid = 0;
-    __atomic_store_n(&slot->lifecycle, session_state(id, SESSION_ACTIVE),
+    /* Hold SESSION_BUSY until the response copy completes in finish_open(). */
+    __atomic_store_n(&slot->lifecycle, session_state(id, SESSION_BUSY),
                      __ATOMIC_RELEASE);
     resp->session_id = id;
     resp->reserved = 0;
@@ -199,6 +200,33 @@ fail:
     __atomic_store_n(&slot->lifecycle, 0, __ATOMIC_RELEASE);
     secdebug_rcu_restore(&dropped);
     return rc;
+}
+
+void secdebug_session_finish_open(uint32_t id, int delivered)
+{
+    int idx;
+    int dropped = 0;
+    struct secdebug_mem_session *slot;
+    uint64_t expected;
+
+    if (!id)
+        return;
+    idx = (int)(id & (SECDEBUG_MAX_MEM_SESSIONS - 1));
+    slot = &g_sessions[idx];
+    expected = session_state(id, SESSION_BUSY);
+    if (delivered) {
+        __atomic_compare_exchange_n(&slot->lifecycle, &expected,
+                                    session_state(id, SESSION_ACTIVE), 0,
+                                    __ATOMIC_RELEASE, __ATOMIC_RELAXED);
+        return;
+    }
+    if (!__atomic_compare_exchange_n(&slot->lifecycle, &expected,
+                                     session_state(id, SESSION_CLOSING), 0,
+                                     __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
+        return;
+    secdebug_rcu_drop(&dropped);
+    session_free(slot);
+    secdebug_rcu_restore(&dropped);
 }
 
 /* A successful claim is a lease; its owner MUST release it before returning. */

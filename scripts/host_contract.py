@@ -22,15 +22,62 @@ MANIFEST = ROOT / 'host_patches/hosts.json'
 CONTRACT = '0x53440101'
 
 
+ISOLATED_GIT_CONFIG: tuple[str, ...] = (
+    '-c', 'core.fsmonitor=false',
+    '-c', 'core.hooksPath=/dev/null',
+    '-c', 'core.pager=cat',
+    '-c', 'core.autocrlf=false',
+    '-c', 'diff.external=',
+)
+
+
+def isolated_git_env() -> dict[str, str]:
+    env = {k: v for k, v in os.environ.items() if not k.startswith('GIT_')}
+    env.update(
+        GIT_NO_REPLACE_OBJECTS='1',
+        GIT_CONFIG_NOSYSTEM='1',
+        GIT_CONFIG_GLOBAL='/dev/null',
+        GIT_ATTR_NOSYSTEM='1',
+        GIT_TERMINAL_PROMPT='0',
+    )
+    return env
+
+
 def git(host: Path, *args: str) -> bytes:
-    env = dict(os.environ, GIT_NO_REPLACE_OBJECTS='1')
-    for key in ('GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE'):
-        env.pop(key, None)
-    proc = subprocess.run(['git', '-C', str(host), *args], env=env,
+    proc = subprocess.run(['git', *ISOLATED_GIT_CONFIG, '--no-optional-locks',
+                           '-C', str(host), *args],
+                          env=isolated_git_env(),
                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if proc.returncode:
         raise ValueError(proc.stderr.decode(errors='replace').strip() or 'git command failed')
     return proc.stdout
+
+
+def apply_patch_isolated(target: Path, patch: Path,
+                         preimages: dict[str, bytes]) -> dict[str, bytes]:
+    env = isolated_git_env()
+    init = subprocess.run(['git', *ISOLATED_GIT_CONFIG, 'init', '-q', '--template='],
+                          cwd=target, env=env,
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if init.returncode:
+        raise ValueError('failed to initialize isolated patch tree: ' +
+                         init.stderr.decode(errors='replace').strip())
+    for name, raw in preimages.items():
+        file = target / name
+        file.parent.mkdir(parents=True, exist_ok=True)
+        file.write_bytes(raw)
+    proc = subprocess.run(['git', *ISOLATED_GIT_CONFIG, 'apply', str(patch.resolve())],
+                          cwd=target, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if proc.returncode:
+        raise ValueError('approved patch does not apply to pinned source: ' +
+                         proc.stderr.decode(errors='replace').strip())
+    patched: dict[str, bytes] = {}
+    for name, raw in preimages.items():
+        after = (target / name).read_bytes()
+        if after == raw:
+            raise ValueError(f'approved patch did not modify expected target: {name}')
+        patched[name] = after
+    return patched
 
 
 def blob_sha(data: bytes) -> str:
@@ -77,18 +124,10 @@ def verify_host(directory: str | Path, commit: str, *, patched: bool = True) -> 
         raise ValueError('patch targets are missing from the host tree')
     if patched:
         with tempfile.TemporaryDirectory(prefix='secdebug-expected-host-') as tmp:
-            target = Path(tmp)
-            for name in paths:
-                file = target / name
-                file.parent.mkdir(parents=True, exist_ok=True)
-                file.write_bytes(git(host, 'show', f'HEAD:{name}'))
-            proc = subprocess.run(['git', 'apply', str(patch)], cwd=target,
-                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            if proc.returncode:
-                raise ValueError('approved patch does not apply to pinned source: ' +
-                                 proc.stderr.decode(errors='replace'))
-            for name in paths:
-                tree[name] = (tree[name][0], blob_sha((target / name).read_bytes()))
+            preimage_bytes = {name: git(host, 'show', f'HEAD:{name}') for name in paths}
+            patched_bytes = apply_patch_isolated(Path(tmp), patch, preimage_bytes)
+            for name, after in patched_bytes.items():
+                tree[name] = (tree[name][0], blob_sha(after))
     digest = hashlib.sha256()
     for name, (mode, expected) in sorted(tree.items()):
         file = host / name

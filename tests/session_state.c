@@ -60,6 +60,15 @@ int secdebug_pin_mm(pid_t pid, struct mm_struct **out, int *dropped)
     return 0;
 }
 
+static int open_committed(const struct secdebug_session_open_req *req,
+                          struct secdebug_session_open_resp *resp)
+{
+    int rc = secdebug_session_open(req, resp);
+    if (rc == 0)
+        secdebug_session_finish_open(resp->session_id, 1);
+    return rc;
+}
+
 #define TEST_CHECK(condition, message) do { \
     if (!(condition)) { fprintf(stderr, "session state: %s at %d\n", (message), __LINE__); \
                        return 1; } \
@@ -90,7 +99,12 @@ int main(void)
     memset(mm_b.bytes, 'B', sizeof(mm_b.bytes));
     secdebug_session_init();
     TEST_CHECK(secdebug_session_ready(), "backend unavailable");
-    TEST_CHECK(secdebug_session_open(&open_req, &open_resp) == 0, "open failed");
+    TEST_CHECK(secdebug_session_open(&open_req, &open_resp) == 0, "open lease failed");
+    TEST_CHECK(secdebug_session_close(open_resp.session_id) == -EBUSY,
+               "uncommitted session was not protected by BUSY lease");
+    secdebug_session_finish_open(open_resp.session_id, 0);
+    TEST_CHECK(mm_a.refs == 0 && task_a.refs == 0, "failed finish_open leaked refs");
+    TEST_CHECK(open_committed(&open_req, &open_resp) == 0, "open failed");
     TEST_CHECK(mm_a.refs == 1 && task_a.refs == 1, "missing pinned references");
     current_pid_mm = &mm_b; /* Simulate PID reuse after first chunk. */
     read_req.session_id = open_resp.session_id;
@@ -124,10 +138,10 @@ int main(void)
 
         current_pid_mm = &mm_a;
         current_owner = &task_a;
-        TEST_CHECK(secdebug_session_open(&open_req, &open_resp) == 0, "keep-open failed");
+        TEST_CHECK(open_committed(&open_req, &open_resp) == 0, "keep-open failed");
         kept = open_resp.session_id;
         current_owner = &task_b;
-        TEST_CHECK(secdebug_session_open(&open_req, &open_resp) == 0,
+        TEST_CHECK(open_committed(&open_req, &open_resp) == 0,
                    "cross-namespace open failed");
         current_owner = &task_a;
         read_req.session_id = kept;
@@ -143,10 +157,10 @@ int main(void)
     /* Owner task exits without close. The next open must reclaim its slot. */
     current_pid_mm = &mm_a;
     current_owner = &task_a;
-    TEST_CHECK(secdebug_session_open(&open_req, &open_resp) == 0, "reopen failed");
+    TEST_CHECK(open_committed(&open_req, &open_resp) == 0, "reopen failed");
     task_a.alive = 0;
     current_owner = &task_b;
-    TEST_CHECK(secdebug_session_open(&open_req, &open_resp) == 0,
+    TEST_CHECK(open_committed(&open_req, &open_resp) == 0,
                "orphan reap failed");
     TEST_CHECK(mm_a.refs == 1 && task_a.refs == 0,
                "orphan refs not reaped");
@@ -154,11 +168,11 @@ int main(void)
     TEST_CHECK(mm_a.refs == 0 && task_b.refs == 0, "reap close leaks");
 
     for (i = 0; i < SECDEBUG_MAX_MEM_SESSIONS; ++i) {
-        TEST_CHECK(secdebug_session_open(&open_req, &open_resp) == 0,
+        TEST_CHECK(open_committed(&open_req, &open_resp) == 0,
                    "early session exhaustion");
         id[i] = open_resp.session_id;
     }
-    TEST_CHECK(secdebug_session_open(&open_req, &open_resp) == -ENOSPC,
+    TEST_CHECK(open_committed(&open_req, &open_resp) == -ENOSPC,
                "slot exhaustion not enforced");
     for (i = 0; i < SECDEBUG_MAX_MEM_SESSIONS; ++i)
         TEST_CHECK(secdebug_session_close(id[i]) == 0, "pool close failed");
@@ -170,10 +184,10 @@ int main(void)
         current_owner = &task_b;
         task_a.alive = 1;
         task_b.alive = 1;
-        TEST_CHECK(secdebug_session_open(&open_req, &open_resp) == 0, "wrap seed open");
+        TEST_CHECK(open_committed(&open_req, &open_resp) == 0, "wrap seed open");
         first = open_resp.session_id;
         g_next_session_id = first;
-        TEST_CHECK(secdebug_session_open(&open_req, &open_resp) == 0, "wrap second open");
+        TEST_CHECK(open_committed(&open_req, &open_resp) == 0, "wrap second open");
         TEST_CHECK(open_resp.session_id != 0 && open_resp.session_id != first,
                    "wrapped id collided with a live session");
         TEST_CHECK(secdebug_session_close(first) == 0, "close wrap seed");

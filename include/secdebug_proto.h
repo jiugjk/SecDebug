@@ -190,7 +190,7 @@ struct secdebug_regs_snapshot {
  */
 struct secdebug_bp_hit_req {
     uint32_t slot_id;       /* Slot ID to query */
-    uint32_t clear_hit;     /* 1: consume hit and reset, 0: peek */
+    uint32_t clear_hit;     /* 1: acknowledge/consume hit (stays disarmed), 0: peek */
 } __attribute__((packed, aligned(8)));
 
 /*
@@ -198,7 +198,7 @@ struct secdebug_bp_hit_req {
  */
 struct secdebug_bp_hit_resp {
     uint32_t slot_id;
-    uint32_t hit_count;     /* Unconsumed hits; clear re-arms the one-shot event */
+    uint32_t hit_count;     /* Unconsumed hits; clear acknowledges without re-arming */
     uint64_t trigger_addr;  /* Exec: PC. Watch: armed data address */
     struct secdebug_regs_snapshot regs;
 } __attribute__((packed, aligned(8)));

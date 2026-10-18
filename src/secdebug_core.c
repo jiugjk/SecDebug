@@ -179,11 +179,11 @@ int secdebug_resolve_symbols(void)
     read_page_size();
     secdebug_task_init();
 
-    g_cap_flags = 0;
+    uint32_t flags = 0;
     if (secdebug_mem_ops_ready())
-        g_cap_flags |= SECDEBUG_CAP_MEM_READ | SECDEBUG_CAP_MEM_WRITE;
+        flags |= SECDEBUG_CAP_MEM_READ | SECDEBUG_CAP_MEM_WRITE;
     if (secdebug_session_ready())
-        g_cap_flags |= SECDEBUG_CAP_MEM_SESSION;
+        flags |= SECDEBUG_CAP_MEM_SESSION;
     /*
      * Symbol resolution is not a hit test. init_pid_ns is required so reap
      * does not use the caller's pid namespace. These are dependency flags,
@@ -194,11 +194,12 @@ int secdebug_resolve_symbols(void)
         g_syms.perf_event_disable_inatomic &&
         secdebug_task_ops_ready() && secdebug_caller_id_ready() &&
         g_init_pid_ns && secdebug_alloc_ready())
-        g_cap_flags |= SECDEBUG_CAP_HW_BREAK | SECDEBUG_CAP_HW_WATCH;
+        flags |= SECDEBUG_CAP_HW_BREAK | SECDEBUG_CAP_HW_WATCH;
+    __atomic_store_n(&g_cap_flags, flags, __ATOMIC_RELEASE);
 
-    if (!(g_cap_flags & SECDEBUG_CAP_MEM_READ))
+    if (!(flags & SECDEBUG_CAP_MEM_READ))
         printk("secdebug: memory operations disabled\n");
-    if (!(g_cap_flags & SECDEBUG_CAP_HW_BREAK))
+    if (!(flags & SECDEBUG_CAP_HW_BREAK))
         printk("secdebug: breakpoint operations disabled\n");
     return 0;
 }
@@ -495,7 +496,7 @@ static long secdebug_control0(const char *ctl_args, char *__user out_msg, int ou
             cap->kp_core_ver = kpver;
             cap->linux_ver = kver;
             cap->page_size = g_page_size;
-            cap->cap_flags = g_cap_flags;
+            cap->cap_flags = __atomic_load_n(&g_cap_flags, __ATOMIC_ACQUIRE);
             cap->max_bp_slots = SECDEBUG_MAX_BP_SLOTS;
             cap->active_bp_cnt = secdebug_hwbp_active_count();
             cap->reserved = 0;
@@ -690,15 +691,15 @@ copy_response:
             secdebug_hwbp_finish_hit(&hit_ack_req, hit_snapshot_total,
                                     copied == resp_total_len);
         }
+        if (registered_slot_pending) {
+            secdebug_hwbp_finish_register(registered_slot_id,
+                                          copied == resp_total_len);
+        }
+        if (opened_session_pending) {
+            secdebug_session_finish_open(opened_session_id,
+                                         copied == resp_total_len);
+        }
         if (copied != resp_total_len) {
-            if (registered_slot_pending) {
-                struct secdebug_bp_unreg_req rollback = { registered_slot_id, 0 };
-                int rollback_rc = secdebug_hwbp_unregister(&rollback);
-                if (rollback_rc && rollback_rc != -ENOENT)
-                    printk("secdebug: BP rollback failed: %d\n", rollback_rc);
-            }
-            if (opened_session_pending)
-                (void)secdebug_session_close(opened_session_id);
             ret = -EFAULT; /* Side effects of writes/closes may already exist. */
             goto out;
         }
